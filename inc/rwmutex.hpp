@@ -14,6 +14,10 @@ namespace util {
 //   bits 1..15  active readers  (max 32767)
 //   bits 16..30 waiting writers (max 32767)
 //
+// Both counters saturate so the 32768th reader waits for one to leave and the
+// 32768th queued writer waits for one to get in, instead of carrying into the
+// neighbouring field.
+//
 // A reader that shows up while a writer is queued parks instead of joining the
 // current batch. Without that a steady stream of readers starves writers
 // forever on a read-heavy workload i think?
@@ -68,11 +72,17 @@ public:
         const uint32_t previous = state_.fetch_sub(kReaderUnit, std::memory_order_release);
         // Last reader out is responsible for releasing any queued writer.
         if (readers_of(previous) == 1 && waiting_writers_of(previous) > 0) wake_writers();
+        else if (readers_of(previous) == kMaxCount) wake_readers();
     }
 
     // write lock registers as a waiter first which blocks new readers
     void lock() noexcept {
-        state_.fetch_add(kWaitingWriterUnit, std::memory_order_relaxed);
+        uint32_t expected = 0;
+        if (state_.compare_exchange_strong(expected, kWriterActive, std::memory_order_acquire,
+                                           std::memory_order_relaxed)) {
+            return;
+        }
+        register_waiting_writer();
         int spin = 0;
         for (;;) {
             uint32_t state = state_.load(std::memory_order_relaxed);
@@ -110,21 +120,43 @@ public:
     }
 
 private:
+    static constexpr uint32_t kMaxCount = 0x7FFFu;
     static constexpr uint32_t kWriterActive = 1u;
     static constexpr uint32_t kReaderUnit = 1u << 1;
-    static constexpr uint32_t kReaderMask = 0x7FFFu << 1;
+    static constexpr uint32_t kReaderMask = kMaxCount << 1;
     static constexpr uint32_t kWaitingWriterUnit = 1u << 16;
-    static constexpr uint32_t kWaitingWriterMask = 0x7FFFu << 16;
+    static constexpr uint32_t kWaitingWriterMask = kMaxCount << 16;
 
     static uint32_t readers_of(uint32_t state) noexcept { return (state & kReaderMask) >> 1; }
     static uint32_t waiting_writers_of(uint32_t state) noexcept {
         return (state & kWaitingWriterMask) >> 16;
     }
     static bool readers_may_enter(uint32_t state) noexcept {
-        return (state & kWriterActive) == 0 && waiting_writers_of(state) == 0;
+        return (state & kWriterActive) == 0 && waiting_writers_of(state) == 0 &&
+               readers_of(state) < kMaxCount;
     }
     static bool writer_may_enter(uint32_t state) noexcept {
         return (state & kWriterActive) == 0 && readers_of(state) == 0;
+    }
+
+    // Bump the waiting count or park if its full
+    void register_waiting_writer() noexcept {
+        uint32_t state = state_.load(std::memory_order_relaxed);
+        for (;;) {
+            if (waiting_writers_of(state) < kMaxCount) {
+                if (state_.compare_exchange_weak(state, state + kWaitingWriterUnit,
+                                                 std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+                    return;
+                }
+                continue;
+            }
+            const uint32_t seq = writer_seq_.load(std::memory_order_acquire);
+            state = state_.load(std::memory_order_relaxed);
+            if (waiting_writers_of(state) < kMaxCount) continue;
+            futex_wait(&writer_seq_, seq);
+            state = state_.load(std::memory_order_relaxed);
+        }
     }
 
     void wake_readers() noexcept {
