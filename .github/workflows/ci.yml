@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: make test CXX=${{ matrix.compiler }}
+      - name: Demo
+        run: make demo CXX=${{ matrix.compiler }}
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [tsan, asan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run suite under sanitizer
+        run: make ${{ matrix.sanitizer }}
